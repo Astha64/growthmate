@@ -467,3 +467,163 @@ sequenceDiagram
 | `app/agent_graph.py` | LangGraph wiring from Section 6 |
 | `app/razorpay_client.py` | Section 7 |
 | `buyer_agent.py` | Standalone script driving Journey B |
+
+---
+
+## 11. Addendum — Resolved Ambiguities (read before implementing)
+
+These resolve gaps flagged during implementation planning. Where this section
+and an earlier section conflict, **this section wins** — it is the more recent,
+more specific decision.
+
+### 11.1 `requirements.txt` — missing LangChain/LangGraph
+Add, unpinned initially (pin exact versions via `pip freeze` once installed,
+since exact current releases move faster than this doc):
+```
+langchain
+langchain-anthropic
+langgraph
+```
+Install, confirm `import langgraph` and `import langchain_anthropic` succeed,
+then update `requirements.txt` with the resolved versions from
+`pip freeze | findstr /I "langchain langgraph"` (Windows) before committing.
+
+### 11.2 `AgentState` — missing fields used by graph wiring
+§6.1's `AgentState` is corrected to:
+```python
+class AgentState(TypedDict):
+    messages: list
+    actor: str
+    session_id: str
+    spend_so_far: float
+    pending_tool_call: dict | None
+    computed_amount: float | None      # NEW - see §11.5
+    last_decision: str | None          # NEW - "ALLOW" | "BLOCK" | None
+    last_decision_reason: str | None   # NEW - guardrail's reason string
+```
+`guardrail_node` writes `last_decision`, `last_decision_reason`, and
+`computed_amount`. The conditional edge in §6.3 reading `s["last_decision"]`
+is now valid against this schema.
+
+### 11.3 `create_payment_link` — full ownership of the multi-step flow
+`tools.py`'s `create_payment_link(sku, quantity, actor, session_id, computed_amount)`
+is the **only** place this sequence happens, in this order:
+1. Look up `Product` by `sku`. If missing or `quantity > stock` → return
+   `{"error": "..."}0`, no DB write, `tool_node` logs `outcome=failed`.
+2. Use `computed_amount` passed in from `guardrail_node` (§11.5) rather than
+   recomputing — avoids a race between the guardrail's quote and execution.
+3. Insert an `Order` row: `status="created"`, `amount=computed_amount`,
+   `product_id`, `actor`, `session_id`.
+4. Call `razorpay_client.create_payment_link(order)`.
+5. On success: update `Order.razorpay_payment_link_id`, return
+   `{"short_url": ..., "order_id": order.id}`.
+6. On failure (Razorpay SDK exception, caught inside `razorpay_client.py` and
+   returned as `{"error": ...}`): update `Order.status = "failed"`, return the
+   error dict — never raise.
+
+`razorpay_client.create_payment_link(order)` stays a thin wrapper — it only
+calls the Razorpay SDK and catches SDK exceptions; it does not touch `Order`
+rows itself. `tools.py` owns persistence; `razorpay_client.py` owns the
+external call.
+
+### 11.4 `seed_data.py` — concrete catalog
+
+| sku | name | price (INR) | stock | category |
+|---|---|---|---|---|
+| SHOE-001 | Nike Revolution 6 | 1899 | 20 | footwear |
+| SHOE-002 | Adidas Duramo SL | 2499 | 15 | footwear |
+| SHOE-003 | Puma Softride | 3299 | 10 | footwear |
+| APP-001 | Cotton Crew T-Shirt | 499 | 50 | apparel |
+| APP-002 | Slim Fit Chinos | 1299 | 25 | apparel |
+| ELEC-001 | Wireless Earbuds | 1999 | 30 | electronics |
+| ELEC-002 | USB-C Fast Charger | 799 | 40 | electronics |
+| HOME-001 | Ceramic Coffee Mug | 349 | 60 | home |
+| HOME-002 | Desk Lamp LED | 1199 | 18 | home |
+| ACC-001 | Leather Wallet | 899 | 22 | accessories |
+
+Prices deliberately span both sides of the buyer-agent per-transaction limit
+(₹3000) — `APP-001` at ₹499 × 10 units = ₹4990 is the exact combination used
+in the Journey B failure demo (§11.5).
+
+### 11.5 `buyer_agent.py` — exact failure mechanics
+The tool schema (§4) only takes `sku` + `quantity`, not a raw amount, so the
+guardrail cannot check a monetary limit without first knowing the price. This
+is resolved by giving `guardrail_node` a narrow, read-only responsibility:
+when the pending tool is `create_payment_link`, `guardrail_node` performs a
+**single read-only DB lookup** of the product's price (not a full tool
+execution — no writes, no Razorpay call), computes
+`computed_amount = price * quantity`, stores it in `state["computed_amount"]`,
+then runs `check_transaction(actor, computed_amount, spend_so_far)`.
+
+`buyer_agent.py`'s scripted failure: request `sku="APP-001"`, `quantity=10`
+→ `computed_amount = 4990` → exceeds `MAX_PER_TRANSACTION["buyer_agent"]`
+(₹3000) → `BLOCK`, reason `"exceeds per-transaction limit of ₹3000"`. No
+Order row is created, no Razorpay call is made — the block happens before
+any external side effect.
+
+### 11.6 Webhook raw body — exact FastAPI pattern
+```python
+@app.post("/webhook/razorpay")
+async def razorpay_webhook(request: Request):
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not verify_webhook_signature(body, signature):
+        raise HTTPException(status_code=400, detail="invalid signature")
+    payload = json.loads(body)
+    # locate Order by payload's payment_link id, update status, commit
+    return {"status": "processed"}
+```
+Use the raw `Request` object and `await request.body()` — never a Pydantic
+model here, since HMAC verification needs the exact original bytes before
+any parsing or re-serialization could alter them.
+
+### 11.7 `spend_so_far` — computed, not accumulated in memory
+LangGraph state is rebuilt fresh on every `/chat` call (it is not a
+long-lived in-memory object across requests), so `spend_so_far` cannot be a
+running variable. Instead, at the very start of handling a `/chat` request,
+before building the initial `AgentState`, run:
+```python
+spend_so_far = db.query(func.sum(Order.amount)).filter(
+    Order.session_id == session_id,
+    Order.actor == actor,
+    Order.status.in_(["created", "paid"])
+).scalar() or 0.0
+```
+`"blocked"`/`"failed"` orders are excluded — only orders that actually
+reached Razorpay count toward the session limit. This lives in `main.py`'s
+`/chat` handler, immediately before invoking the graph.
+
+### 11.8 Test scope — concrete scenarios and mocking strategy
+
+- **`test_guardrail.py`**: pure function, table-driven, no mocking — this was
+  already correctly scoped as-is.
+- **`test_tools.py`**: use a temporary SQLite file (or `sqlite:///:memory:`
+  with a shared connection) via a pytest fixture that overrides `app.db`'s
+  session; seed 2–3 products directly in the test. Monkeypatch
+  `razorpay_client.create_payment_link` to return a canned success dict for
+  the happy-path test, and a canned `{"error": ...}` for the failure-path
+  test — no real network call in any test.
+- **`test_chat.py`**: use FastAPI's `TestClient`; monkeypatch the LLM-calling
+  function inside `agent_node` (not the whole module) to return a scripted
+  tool-call response, so tests don't require a real Anthropic API key or
+  network access. Cover: (a) a read-only tool flow returns
+  `tool_calls_made` correctly, (b) a blocked money action returns
+  `"blocked": true` with a `200`, (c) `AuditLog` gains exactly one row per
+  request.
+
+### 11.9 `frontend/chat.js` — flat structure, no actor selector
+`frontend/chat.js` and `frontend/style.css` sit directly under `frontend/`
+alongside `index.html` and `audit.html` — no subfolders. The chat UI
+hardcodes `actor: "human"` in every `/chat` request; it does **not** expose
+an actor selector. The buyer-agent journey is demonstrated exclusively
+through running `buyer_agent.py`, not through any UI control — this keeps
+frontend scope minimal without weakening the demo story.
+
+### 11.10 Deployment — Render, dashboard start command, no `Procfile`
+Deploy on **Render** (decision, not Railway). Render uses a dashboard-configured
+start command, not a `Procfile` (that's a Heroku/Railway convention) — so no
+`Procfile` is added to the repo. Start command, documented in `README.md`'s
+deployment section:
+```
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
+```

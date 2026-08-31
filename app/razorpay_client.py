@@ -1,0 +1,60 @@
+"""
+Thin Razorpay SDK wrapper. Matches LOW_LEVEL_DESIGN.md §7.
+
+  - create_payment_link(order): calls the Payment Links API, catches SDK
+    exceptions and returns {"error": ...} — never raises up to tool_node.
+    Does NOT touch Order rows itself; tools.py owns persistence (§11.3).
+  - verify_webhook_signature(payload_body, signature_header): constant-time
+    HMAC-SHA256 check using RAZORPAY_KEY_SECRET.
+"""
+
+import hashlib
+import hmac
+import os
+
+import razorpay
+from dotenv import load_dotenv
+
+load_dotenv()
+
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET", "")
+
+
+def _client() -> razorpay.Client:
+    return razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
+
+def create_payment_link(order) -> dict:
+    """
+    Calls Razorpay Payment Links API with order.amount / order.currency and a
+    reference id = order.id. Returns {"short_url": ..., "id": ...} on success,
+    or {"error": str(e)} on SDK exception — never raises.
+    """
+    try:
+        client = _client()
+        data = {
+            "amount": int(round(order.amount * 100)),  # paise
+            "currency": order.currency,
+            "description": f"GrowthMate order #{order.id}",
+            "reference_id": f"gm-order-{order.id}",
+            "notes": {"order_id": order.id},
+        }
+        response = client.payment_link.create(data)
+        return {
+            "id": response.get("id"),
+            "short_url": response.get("short_url"),
+            "order_id": response.get("order_id"),
+        }
+    except Exception as e:  # noqa: BLE001 - degrade to dict, never raise
+        return {"error": str(e)}
+
+
+def verify_webhook_signature(payload_body: bytes, signature_header: str) -> bool:
+    """
+    HMAC-SHA256 of payload_body using RAZORPAY_KEY_SECRET, compared to
+    signature_header via hmac.compare_digest (constant-time).
+    """
+    secret = RAZORPAY_KEY_SECRET.encode("utf-8")
+    expected = hmac.new(secret, payload_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
