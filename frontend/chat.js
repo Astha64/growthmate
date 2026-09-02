@@ -1,13 +1,21 @@
 /*
  * chat.js — GrowthMate chat UI. Hardcodes actor:"human" for every /chat
- * request (LLD §11.9 — no actor selector; buyer-agent journey runs via
- * buyer_agent.py, not the UI).
+ * request (no actor selector; the buyer-agent journey runs via buyer_agent.py,
+ * not the UI).
+ *
+ * Revision 2: carries the conversation history across turns (via the optional
+ * `history` field on /chat) so the multi-turn pipeline works in the UI:
+ * clarifying question -> discovery -> selection -> upsell -> checkout ->
+ * approval -> payment. Structured output (numbered recommendation lists,
+ * checkout previews) is lightly formatted; all text is escaped.
  */
 
 const SESSION_KEY = "growthmate_session";
 const messagesEl = document.getElementById("messages");
 const formEl = document.getElementById("chat-form");
 const inputEl = document.getElementById("input");
+
+let history = [];
 
 function getSessionId() {
   let id = localStorage.getItem(SESSION_KEY);
@@ -18,10 +26,51 @@ function getSessionId() {
   return id;
 }
 
-function appendMessage(role, text) {
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Light formatting for common agent output: bullet/numbered lines and
+// "Label: value" checkout lines. All input is escaped before being placed.
+function formatReply(text) {
+  if (!text) return "";
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const hasList = lines.some((l) => /^\s*(\d+[.)]|[-*])\s/.test(l));
+  if (!hasList) {
+    return escapeHtml(text).replace(/\n+/g, "<br>");
+  }
+  let inList = false;
+  let html = "";
+  for (const line of lines) {
+    if (/^\s*(\d+[.)]|[-*])\s/.test(line)) {
+      if (!inList) {
+        html += "<ul>";
+        inList = true;
+      }
+      const item = line.replace(/^\s*(\d+[.)]|[-*])\s/, "").trim();
+      html += "<li>" + escapeHtml(item) + "</li>";
+    } else {
+      if (inList) {
+        html += "</ul>";
+        inList = false;
+      }
+      html += "<p>" + escapeHtml(line) + "</p>";
+    }
+  }
+  if (inList) html += "</ul>";
+  return html;
+}
+
+function appendMessage(role, text, isHtml) {
   const div = document.createElement("div");
   div.className = "msg " + (role === "user" ? "user" : "bot");
-  div.textContent = text;
+  if (isHtml) {
+    div.innerHTML = text;
+  } else {
+    div.textContent = text;
+  }
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
@@ -42,6 +91,7 @@ async function send(message) {
     session_id: getSessionId(),
     actor: "human",
     message: message,
+    history: history,
   };
 
   try {
@@ -52,7 +102,16 @@ async function send(message) {
     });
     const data = await resp.json();
     if (typing) typing.remove();
-    appendMessage("bot", data.reply || "(no reply)");
+
+    const reply = data.reply || "(no reply)";
+    appendMessage("bot", formatReply(reply), true);
+
+    // Record the turn in local history so the next message has full context.
+    history = history.concat([
+      { role: "user", content: message },
+      { role: "assistant", content: reply },
+    ]);
+
     if (data.blocked) appendBlockNotice();
   } catch (err) {
     if (typing) typing.remove();

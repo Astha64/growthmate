@@ -1,9 +1,19 @@
 """
 Pure-function tests for the guardrail layer. Must NOT touch the DB or network
 (AGENTS.md gotcha). Table-driven, no mocking (LLD §11.8).
+
+Covers BOTH independent checks (LLD §6):
+  - validate_approval (§6.1): approved / not-approved / ambiguous -> blocked
+  - check_transaction (§6.2): spend limits
 """
 
-from app.guardrail import ALLOWED_ACTORS, MAX_PER_SESSION, MAX_PER_TRANSACTION, check_transaction
+from app.guardrail import (
+    ALLOWED_ACTORS,
+    MAX_PER_SESSION,
+    MAX_PER_TRANSACTION,
+    check_transaction,
+    validate_approval,
+)
 
 HUMAN_TX = MAX_PER_TRANSACTION["human"]  # 5000
 BA_TX = MAX_PER_TRANSACTION["buyer_agent"]  # 3000
@@ -82,3 +92,63 @@ def test_pure_function_deterministic():
     a = check_transaction("buyer_agent", 2500.0, 0.0)
     b = check_transaction("buyer_agent", 2500.0, 0.0)
     assert a.allowed == b.allowed and a.reason == b.reason
+
+
+# ---------------------------------------------------------------------------
+# validate_approval (§6.1) — fail-closed approval classification.
+# ---------------------------------------------------------------------------
+
+def _state(preview_shown: bool, last_user_msg: str) -> dict:
+    return {
+        "checkout_preview": {"total": 3448.0} if preview_shown else None,
+        "messages": [{"role": "user", "content": last_user_msg}],
+    }
+
+
+def test_approval_explicit_yes():
+    assert validate_approval(_state(True, "yes")) is True
+
+
+def test_approval_go_ahead():
+    assert validate_approval(_state(True, "go ahead")) is True
+
+
+def test_approval_looks_good_with_extra_affirmation():
+    assert validate_approval(_state(True, "yes, go ahead")) is True
+
+
+def test_approval_phrased_confirmation():
+    assert validate_approval(_state(True, "looks good, please proceed")) is True
+
+
+def test_approval_missing_preview_is_not_approved():
+    # Fail-closed: no checkout preview shown -> never approved.
+    assert validate_approval(_state(False, "yes")) is False
+
+
+def test_approval_missing_user_message_is_not_approved():
+    state = {"checkout_preview": {"total": 3448.0}, "messages": []}
+    assert validate_approval(state) is False
+
+
+def test_approval_blank_user_message_is_not_approved():
+    assert validate_approval(_state(True, "")) is False
+
+
+def test_approval_negative_is_not_approved():
+    assert validate_approval(_state(True, "no")) is False
+    assert validate_approval(_state(True, "no thanks")) is False
+
+
+def test_approval_ambiguous_defaults_to_blocked():
+    # "not sure"/"maybe" contain no unambiguous approval -> fail-closed False.
+    assert validate_approval(_state(True, "not sure")) is False
+    assert validate_approval(_state(True, "maybe")) is False
+    assert validate_approval(_state(True, "wait a moment")) is False
+    assert validate_approval(_state(True, "hold on")) is False
+
+
+def test_approval_is_deterministic():
+    a = validate_approval(_state(True, "yes"))
+    b = validate_approval(_state(True, "yes"))
+    assert a is True and b is True

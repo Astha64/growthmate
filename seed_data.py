@@ -1,6 +1,8 @@
 """
-Populates the `products` table with the concrete 10-item catalog from
-LOW_LEVEL_DESIGN.md §11.4. Idempotent: skips SKUs that already exist.
+Populates the `products` table with the concrete 10-item merchant catalog from
+LOW_LEVEL_DESIGN.md §11.4. The merchant catalog is the **upsell/cross-sell
+source only** (LLD §2.1, ARCHITECTURE §2) — it is never primary product
+discovery. Idempotent: skips SKUs that already exist.
 """
 
 from app.db import SessionLocal, init_db

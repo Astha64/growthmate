@@ -3,14 +3,20 @@ GrowthMate FastAPI routes — routing only, no business logic (LLD §10).
 
 Endpoints:
   GET  /health            liveness
-  GET  /catalog           agent-readable catalog (LLD §3)
+  GET  /catalog           merchant catalog (upsell source, LLD §3)
   POST /chat              agent conversation (human or buyer_agent)
   GET  /audit             audit trail (LLD §3)
   POST /webhook/razorpay  Razorpay payment-status webhook (§11.6)
 
-Per §11.7, spend_so_far is computed fresh from the DB at the start of each
-/chat call (state is not long-lived across requests). The webhook reads the
-raw body via await request.body() for HMAC verification (LLD §7 / §11.6).
+spend_so_far is computed fresh from the DB at the start of each /chat call
+(state is not long-lived across requests). Revision 2: sums Order.total
+(multi-item) instead of the old single-product Order.amount.
+
+To support a multi-turn pipeline (clarification -> discovery -> ... -> approval),
+the /chat endpoint also reconstructs the session's shown checkout preview (and
+its backend-computed total) from the current cart_items rows when the cart is
+non-empty. This is what lets approval_node fail-closed on "a preview was shown"
+across separate /chat invocations — see LLD §5 / §6.1.
 """
 
 import json
@@ -34,6 +40,7 @@ from app.schemas import (
     ProductOut,
     WebhookResponse,
 )
+from app.tools import prepare_checkout
 
 app = FastAPI(title="GrowthMate API", version="0.1.0")
 
@@ -54,7 +61,7 @@ def health_check():
 
 @app.get("/catalog", response_model=CatalogResponse)
 def get_catalog(db: Session = Depends(get_db)):
-    """Agent-readable catalog: explicit fields + currency, no formatting (LLD §3)."""
+    """Merchant catalog: explicit fields + currency, no formatting (LLD §3)."""
     products = db.query(Product).all()
     return CatalogResponse(
         currency="INR",
@@ -76,14 +83,16 @@ def get_catalog(db: Session = Depends(get_db)):
 def chat(req: ChatRequest):
     """
     Runs the LangGraph agent loop for the given message. Accepts both human and
-    buyer_agent actors. Money actions are gated by guardrail_node; blocks return
-    HTTP 200 with blocked=true (expected control flow, not an error).
+    buyer_agent actors. Money actions are gated by approval_node then
+    guardrail_node; blocks return HTTP 200 with blocked=true (expected control
+    flow, not an error).
     """
-    # §11.7: compute spend_so_far fresh from DB, excluding blocked/failed orders.
+    # Spend so far: fresh from DB, excluding blocked/failed orders. Rev 2 sums
+    # Order.total (multi-item) rather than the old single-item Order.amount.
     db = db_module.SessionLocal()
     try:
         spend_so_far = (
-            db.query(func.coalesce(func.sum(Order.amount), 0.0))
+            db.query(func.coalesce(func.sum(Order.total), 0.0))
             .filter(
                 Order.session_id == req.session_id,
                 Order.actor == req.actor,
@@ -95,16 +104,41 @@ def chat(req: ChatRequest):
     finally:
         db.close()
 
+    # Reconstruct messages from optional history + the current message.
+    messages = list(req.history or [])
+    messages.append({"role": "user", "content": req.message})
+
+    # Reconstruct the shown checkout preview (and backend total) for the session
+    # if the cart is non-empty — the precondition approval_node checks (LLD §6.1).
+    preview = prepare_checkout(req.session_id)
+    checkout_preview = preview if preview and preview.get("items") else None
+    cart_total = (checkout_preview or {}).get("total")
+
     initial_state = {
-        "messages": [{"role": "user", "content": req.message}],
+        "messages": messages,
         "actor": req.actor,
         "session_id": req.session_id,
+
+        "structured_requirements": None,
+        "requirements_complete": False,
+
+        "discovery_results": None,
+        "selected_product": None,
+        "upsell_candidates": None,
+
+        "cart": [],
+        "cart_total": cart_total,
+        "checkout_preview": checkout_preview,
+        "approval_confirmed": False,
+
         "spend_so_far": float(spend_so_far),
-        "pending_tool_call": None,
-        "computed_amount": None,
+        "computed_amount": cart_total,
         "last_decision": None,
         "last_decision_reason": None,
-        "tool_result": None,
+
+        "pending_tool_call": None,
+        "payment_state": None,
+        "order_id": None,
         "tools_called": [],
     }
 
@@ -118,7 +152,7 @@ def chat(req: ChatRequest):
         session_id=req.session_id,
         reply=reply,
         tool_calls_made=tool_calls,
-        blocked=blocked,
+        blocked=bool(blocked),
     )
 
 
@@ -126,9 +160,27 @@ def _extract_reply(state: dict) -> str:
     """Return the last assistant message that is plain text (not part of a tool call)."""
     messages = state.get("messages", [])
     for msg in reversed(messages):
-        role = msg.get("role")
-        if role == "assistant" and msg.get("content"):
-            return msg["content"]
+        if isinstance(msg, dict):
+            role = msg.get("role")
+            content = msg.get("content")
+        else:
+            # LangChain AIMessage exposes .type ("ai") rather than .role; the
+            # dictionary form uses role == "assistant". Accept both.
+            role = getattr(msg, "role", None) or getattr(msg, "type", None)
+            content = getattr(msg, "content", None)
+        if role in ("assistant", "ai") and content:
+            # content may be a str or a list of content blocks ('text' keys).
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = [
+                    b if isinstance(b, str) else b.get("text", "")
+                    for b in content
+                    if isinstance(b, str) or (isinstance(b, dict) and b.get("text"))
+                ]
+                text = " ".join(parts).strip()
+                if text:
+                    return text
     return "I'm sorry, I couldn't complete that request."
 
 
@@ -150,11 +202,12 @@ def get_audit(session_id: str | None = None, db: Session = Depends(get_db)):
             id=r.id,
             session_id=r.session_id,
             actor=r.actor,
+            event_type=r.event_type,
             tool_name=r.tool_name,
             parameters_json=r.parameters_json,
             agent_reasoning=r.agent_reasoning,
-            guardrail_decision=r.guardrail_decision,
-            guardrail_reason=r.guardrail_reason,
+            decision=r.decision,
+            reason=r.reason,
             outcome=r.outcome,
             error_detail=r.error_detail,
             created_at=r.created_at.isoformat() if r.created_at else "",

@@ -1,9 +1,11 @@
 """
-Thin Razorpay SDK wrapper. Matches LOW_LEVEL_DESIGN.md §7.
+Thin Razorpay SDK wrapper. Matches LOW_LEVEL_DESIGN.md §7 / §10.
 
   - create_payment_link(order): calls the Payment Links API, catches SDK
     exceptions and returns {"error": ...} — never raises up to tool_node.
-    Does NOT touch Order rows itself; tools.py owns persistence (§11.3).
+    Does NOT touch Order rows itself; tools.py owns persistence.
+    Revision 2: reads order.total (multi-item cart) instead of a single
+    product's price*quantity.
   - verify_webhook_signature(payload_body, signature_header): constant-time
     HMAC-SHA256 check using RAZORPAY_KEY_SECRET.
 """
@@ -27,14 +29,14 @@ def _client() -> razorpay.Client:
 
 def create_payment_link(order) -> dict:
     """
-    Calls Razorpay Payment Links API with order.amount / order.currency and a
+    Calls Razorpay Payment Links API with order.total / order.currency and a
     reference id = order.id. Returns {"short_url": ..., "id": ...} on success,
     or {"error": str(e)} on SDK exception — never raises.
     """
     try:
         client = _client()
         data = {
-            "amount": int(round(order.amount * 100)),  # paise
+            "amount": int(round(order.total * 100)),  # paise; multi-item total
             "currency": order.currency,
             "description": f"GrowthMate order #{order.id}",
             "reference_id": f"gm-order-{order.id}",
