@@ -141,7 +141,12 @@ TOOLS = [
 def discover_and_recommend_products(structured_requirements: dict) -> dict:
     """/4.1 — single deterministic pipeline call (LLD §4.1, §7)."""
     try:
-        return _discover(structured_requirements or {})
+        req = structured_requirements
+        if isinstance(req, str):  # model may hand us JSON as a string
+            req = json.loads(req) if req.strip() else {}
+        if not isinstance(req, dict):
+            req = {}
+        return _discover(req)
     except Exception as e:  # noqa: BLE001 - degrade to a clean error dict
         return {"error": f"discovery failed: {e}"}
 
@@ -196,10 +201,26 @@ def search_catalog(query: str, max_price: float | None = None) -> list[dict]:
 # §4.2  Merchant Upsell / Cross-sell.
 # ---------------------------------------------------------------------------
 
+def _coerce(value):
+    """Gemini may hand structured args as JSON strings; parse them back to
+    dicts/lists. Not JSON => return unchanged."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:  # noqa: BLE001
+            return value
+    return value
+
+
 def recommend_complementary_products(selected_product: dict) -> dict:
     """Suggest 2-3 complementary items from the merchant catalog based on the
     selected product's category, using the category-adjacency map (LLD §8).
     """
+    selected_product = _coerce(selected_product)
+    if isinstance(selected_product, str):
+        selected_product = {"name": selected_product}
+    if not isinstance(selected_product, dict):
+        selected_product = {}
     category = (selected_product or {}).get("category") or ""
     related_categories = CATEGORY_ADJACENCY.get(category, [])
     if not related_categories:
@@ -290,6 +311,11 @@ def update_cart(action: str, item: dict) -> dict:
     CartEvent breadcrumb. The response always carries the freshly recomputed
     cart totals.
     """
+    item = _coerce(item)
+    if isinstance(item, str):
+        item = {}
+    if not isinstance(item, dict):
+        item = {}
     session_id = str(item.get("session_id") or "")
     item_type = str(item.get("type") or "")
     ref_id = str(item.get("ref_id") or "")

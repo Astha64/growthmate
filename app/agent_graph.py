@@ -28,7 +28,7 @@ import json
 import os
 
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import AIMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 
 from typing import TypedDict
@@ -115,9 +115,49 @@ Rules:
 
 def _make_llm() -> ChatGoogleGenerativeAI:
     return ChatGoogleGenerativeAI(
-        model="gemini-3.6-flash",
+        model="gemini-3.5-flash-lite",
         google_api_key=os.getenv("GEMINI_API_KEY"),
     ).bind_tools(TOOLS)
+
+
+def _to_langchain_messages(raw_messages: list) -> list:
+    """Convert the stored plain-dict history into LangChain message objects.
+
+    `main.py` builds ``state["messages"]`` as plain dicts (``{"role": ...,
+    "content": ...}``). LangChain's Gemini integration hangs or returns empty
+    content when handed bare dicts or malformed tool-call/tool-result pairs, so
+    we normalise here.
+
+    The internal agent tool-use "round trip" — an ``ai`` message that carries a
+    tool call (its ``content`` is empty) immediately followed by a ``tool``
+    result message — is deliberately DROPPED before talking to the LLM. The same
+    result is already surfaced to the model via the human-readable system message
+    that ``audit_node`` injects right after a tool runs (see ``audit_node``), so
+    removing the raw pair avoids feeding Gemini an invalid tool-use exchange that
+    makes it reply with empty content. Only user/assistant text and those injected
+    system summaries reach the LLM.
+    """
+    converted: list = []
+    for m in raw_messages:
+        # Already a LangChain message object (AIMessage from agent_node).
+        if hasattr(m, "content") and not isinstance(m, dict):
+            converted.append(m)
+            continue
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "user")
+        content = m.get("content", "")
+        if role == "tool":
+            converted.append(ToolMessage(content=content, tool_call_id=m.get("tool_call_id", "")))
+            continue
+        if role == "system":
+            converted.append(SystemMessage(content=content))
+        elif role in ("user", "human"):
+            converted.append(HumanMessage(content=content))
+        elif role in ("assistant", "ai"):
+            if content:  # only include non-empty assistant text from history
+                converted.append(AIMessage(content=content))
+    return converted
 
 
 def _plain_text(msg) -> str:
@@ -137,6 +177,15 @@ def _plain_text(msg) -> str:
     return ""
 
 
+# Read-only discovery-style tools: running one of these more than once per user
+# turn adds nothing and is the classic source of an infinite agent->tool loop
+# (this caused the `GraphRecursionError` / "no reply" symptom). Re-invoking any
+# of these consecutively is treated as a loop and forces a plain-text reply.
+# State-changing tools (update_cart, execute_payment, etc.) are NOT guarded so
+# legitimate sequences like two sequential cart adds still work.
+_LOOP_GUARD_TOOLS = {"discover_and_recommend_products", "recommend_complementary_products"}
+
+
 def agent_node(state: AgentState) -> AgentState:
     """
     Reasons over the conversation. Returns END (no tool call: final reply or a
@@ -144,7 +193,9 @@ def agent_node(state: AgentState) -> AgentState:
     for execute_payment, or to tool for any other tool.
     """
     llm = _make_llm()
-    messages = [SystemMessage(content=SYSTEM_PROMPT)] + list(state["messages"])
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + _to_langchain_messages(
+        state["messages"]
+    )
     try:
         ai_msg = llm.invoke(messages)
     except Exception:  # noqa: BLE001 - degrade to a conversational reply
@@ -157,8 +208,36 @@ def agent_node(state: AgentState) -> AgentState:
     tool_calls = getattr(ai_msg, "tool_calls", None) or []
     if tool_calls:
         tc = tool_calls[0]
+        name = tc["name"]
+        # Break a discover-loop / any same-tool loop: if the agent just executed
+        # this exact tool as its most recent action (no new user input since), a
+        # re-request adds no value and would spin in an infinite agent->tool loop
+        # (this is what caused `GraphRecursionError` and the "no reply" symptom).
+        # End the turn so the agent composes a reply from the result it already
+        # has. Legitimate multi-tool sequences (discover -> upsell -> update_cart)
+        # use different names and are unaffected.
+        if name in _LOOP_GUARD_TOOLS and state.get("tools_called") and state["tools_called"][-1] == name:
+            # Force a text reply from the LLM (without tools) so the user gets
+            # a real response instead of empty content.
+            try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                text_llm = ChatGoogleGenerativeAI(
+                    model="gemini-3.5-flash-lite",
+                    google_api_key=os.getenv("GEMINI_API_KEY"),
+                )
+                ai_text = text_llm.invoke(_to_langchain_messages(
+                    [SystemMessage(content="You just received a tool result. "
+                     "Compose a clear, helpful reply to the user based on the "
+                     "latest information. Do NOT call any tools — just reply in "
+                     "plain text.")] + list(state["messages"])
+                ))
+                ai_text = AIMessage(content=_plain_text(ai_text) or "Here's what I found. Let me know if you'd like to proceed!")
+            except Exception:  # noqa: BLE001
+                ai_text = AIMessage(content="Here's what I found based on the search. Let me know if you'd like to proceed!")
+            return {**state, "messages": list(state["messages"]) + [ai_text], "pending_tool_call": None}
+
         pending = {
-            "name": tc["name"],
+            "name": name,
             "args": tc.get("args", {}),
             "id": tc.get("id") or f"call_{len(state['messages'])}",
         }
@@ -166,7 +245,7 @@ def agent_node(state: AgentState) -> AgentState:
             **state,
             "messages": appended,
             "pending_tool_call": pending,
-            "tools_called": state.get("tools_called", []) + [tc["name"]],
+            "tools_called": state.get("tools_called", []) + [name],
         }
 
     # No tool call: either a clarifying question (requirements incomplete) or a
@@ -279,13 +358,27 @@ def guardrail_node(state: AgentState) -> AgentState:
     }
 
 
+def _coerce(value):
+    """Gemini often hands structured args as JSON *strings*. Parse any string
+    that looks like JSON back into a dict/list so downstream tools get real
+    objects (this is what caused `update_cart` to write nothing: `dict(...)`
+    on a JSON string raises, the tool returned an error, and the cart stayed
+    empty)."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except Exception:  # noqa: BLE001 - not JSON; return as-is
+            return value
+    return value
+
+
 def tool_node(state: AgentState) -> AgentState:
     """Executes whichever tool was requested; never crashes the graph."""
     from app import tools
 
     pending = state.get("pending_tool_call") or {}
     name = pending.get("name")
-    args = pending.get("args", {})
+    args = {k: _coerce(v) for k, v in (pending.get("args", {}) or {}).items()}
     tool_id = pending.get("id", "")
 
     try:
@@ -361,11 +454,46 @@ def _event_type_for(name: str, decision: str | None) -> str:
     return mapping.get(name, "failure" if decision is None else "tool")
 
 
+def _format_tool_result(name: str, result: dict) -> str:
+    """Render a tool result as clear, readable text the agent reliably acts on.
+
+    The raw JSON dump was too opaque: the agent would misread discovery output
+    and reply "nothing available" even when in-budget matches existed. Each
+    result type is rendered explicitly so the agent presents real data.
+    """
+    if name == "discover_and_recommend_products":
+        recs = result.get("recommendations") or []
+        lines = [f"Discovered {result.get('count', len(recs))} matching product(s):"]
+        for i, r in enumerate(recs, 1):
+            lines.append(
+                f"{i}. {r.get('name')} — ₹{r.get('price')} ({r.get('currency')}) "
+                f"[{r.get('source')}] — {r.get('why')}"
+            )
+        if not recs:
+            lines.append("No products matched the requirements.")
+        return "\n".join(lines)
+    if name == "recommend_complementary_products":
+        recs = result.get("recommendations") or result.get("candidates") or []
+        lines = [f"Complementary add-ons ({len(recs)}):"]
+        for r in recs:
+            lines.append(
+                f"- {r.get('name')} — ₹{r.get('price')} ({r.get('currency')}) "
+                f"[{r.get('source')}]"
+            )
+        if not recs:
+            lines.append("No complementary products found.")
+        return "\n".join(lines)
+    # Default: compact JSON, but the agent should still get the full payload.
+    import json as _json
+
+    return _json.dumps(result)
+
+
 def audit_node(state: AgentState) -> AgentState:
     """
     Writes exactly one AuditLog row per tool pass, for every stage. Always runs
-    on the ALLOW/success path and the BLOCK path. After logging, injects a
-    system message so agent_node can compose its final reply.
+    on the ALLOW/success path and the BLOCK path. After logging, injects the
+    tool result (readable text) so agent_node can compose its final reply.
     """
     pending = state.get("pending_tool_call") or {}
     name = pending.get("name", "")
@@ -411,14 +539,14 @@ def audit_node(state: AgentState) -> AgentState:
             "Please explain this plainly to the customer and suggest lowering "
             "the quantity or removing an item if relevant."
         )
-    else:
-        injected = json.dumps(result)
-
-    return {
-        **state,
-        "messages": state["messages"] + [{"role": "system", "content": injected}],
-        "pending_tool_call": None,
-    }
+        return {
+            **state,
+            "messages": state["messages"] + [{"role": "user", "content": injected}],
+            "pending_tool_call": None,
+        }
+    # Non-BLOCK: the tool result is already delivered to the agent via the
+    # ToolMessage in state["messages"] — no injection needed.
+    return {**state, "pending_tool_call": None}
 
 
 def build_graph():

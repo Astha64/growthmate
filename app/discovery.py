@@ -23,7 +23,11 @@ Each factor contributes to a `_score` and a `_why` string so the
 recommendation text stays explainable.
 """
 
+import os
+
 from dataclasses import dataclass, field
+
+import requests
 
 # ---------------------------------------------------------------------------
 # Internal mock "external" product sources.
@@ -124,19 +128,88 @@ _MOCK_SOURCES: dict[str, list[dict]] = {
 }
 
 
-def search_external_sources(requirements: dict) -> list[dict]:
-    """Return raw candidate dicts from all accessible external sources.
+def _build_search_query(requirements: dict) -> str:
+    """Turn structured requirements into a search phrase for a real web engine.
 
-    Degrades gracefully: each source is wrapped so a failure (or empty result)
-    skips that source instead of failing the whole discovery request. The
-    final list is the concatenation of raw candidate dicts across sources.
+    Uses the explicit product category the user asked for, plus any noted
+    keywords (brand, feature, type), so the query targets what the user
+    explicitly requested rather than the merchant's curated DB.
     """
+    category = (requirements.get("category") or "").strip()
+    keywords = (requirements.get("keywords") or [])
+
+    terms = [t for t in [category] + list(keywords) if t]
+    if not terms:
+        terms = ["product"]
+    # Add a marketplace intent so results look like purchasable listings.
+    return " ".join(terms) + " buy"
+
+
+def _serpapi_shopping(query: str, api_key: str) -> list[dict]:
+    """Query SerpAPI Google Shopping and return raw product candidate dicts."""
+    url = "https://serpapi.com/search.json"
+    params = {
+        "engine": "google_shopping",
+        "q": query,
+        "api_key": api_key,
+        "hl": "en",
+        "gl": "in",
+        "num": 10,
+    }
+    resp = requests.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    results = data.get("shopping_results") or []
     candidates: list[dict] = []
-    for source_name, raw_items in _MOCK_SOURCES.items():
+    for item in results:
+        price = 0.0
+        price_str = item.get("price") or ""
         try:
-            candidates.extend(raw_items)
-        except Exception:  # noqa: BLE001 - skip a failing source, never fail discovery
-            continue
+            price = float(str(price_str).replace("₹", "").replace(",", "").strip())
+        except ValueError:
+            price = 0.0
+        candidates.append({
+            "source_url": item.get("link") or item.get("product_link") or "",
+            "title": item.get("title") or item.get("name") or "",
+            "price": price,
+            "currency": "INR",
+            "brand": item.get("brand") or "",
+            "features": [],
+            "rating": float(item.get("rating") or 0.0),
+            "availability": "in_stock" if item.get("in_stock") else "unknown",
+        })
+    return candidates
+
+
+def search_external_sources(requirements: dict) -> list[dict]:
+    """Return raw candidate dicts from real external product sources.
+
+    Uses SerpAPI (Google Shopping) with `SERPAPI_KEY` from the environment to
+    search actual websites for the product the user explicitly asked for. If
+    `SERPAPI_KEY` is not configured or the live call fails/returns nothing, this
+    degrades gracefully to the deterministic offline mock catalog so the system
+    still works end-to-end during the hackathon and in tests.
+
+    The final list is the concatenation of raw candidate dicts across sources.
+    """
+    query = _build_search_query(requirements)
+    api_key = os.getenv("SERPAPI_KEY")
+
+    candidates: list[dict] = []
+    if api_key:
+        try:
+            live = _serpapi_shopping(query, api_key)
+            candidates.extend(live)
+        except Exception:  # noqa: BLE001 - a failing live source never fails discovery
+            candidates = []
+
+    # Fallback to deterministic mock catalog when no live data is available.
+    if not candidates:
+        for source_name, raw_items in _MOCK_SOURCES.items():
+            try:
+                candidates.extend(raw_items)
+            except Exception:  # noqa: BLE001 - skip a failing source, never fail discovery
+                continue
     return candidates
 
 
@@ -229,7 +302,13 @@ def meets_hard_constraints(product: dict, requirements: dict) -> bool:
         + [f.lower() for f in product.get("features", [])]
     )
     for feature in req_features:
-        if str(feature).lower() not in haystack:
+        # Split multi-word features (e.g. "running shoes") into individual
+        # tokens. A product matches if ANY of the tokens appear in the
+        # haystack — this way "running shoes" matches products tagged "running".
+        tokens = str(feature).lower().split()
+        if not tokens:
+            continue
+        if not any(tok in haystack for tok in tokens):
             return False
 
     availability = requirements.get("requires_availability", True)
